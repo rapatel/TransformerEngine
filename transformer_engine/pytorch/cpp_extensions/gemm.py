@@ -7,6 +7,7 @@
 from typing import Iterable, Optional, Tuple, Union, List
 import os
 import torch
+import logging
 import transformer_engine_torch as tex
 from ..constants import TE_DType
 from ..utils import get_sm_count, _empty_tensor
@@ -14,6 +15,9 @@ from ..utils import get_sm_count, _empty_tensor
 from ..tensor.quantized_tensor import Quantizer
 from ..tensor._internal.float8_blockwise_tensor_base import Float8BlockwiseQTensorBase
 from ...debug.pytorch.debug_quantization import DebugQuantizer
+
+# Set up logger
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "general_gemm",
@@ -125,6 +129,46 @@ def general_gemm(
         "alpha": alpha,
         "beta": beta,
     }
+
+    # Check values for type None for both kwargs and args
+    for key, value in kwargs.items():
+        if value is None:
+            logger.info(f"DEBUG general_gemm: Value for {key} is None")
+    for value in args:
+        args_str = ""
+        if A is None:
+            args_str += "A,"
+        if transa is None:
+            args_str += "transa,"
+        if B is None:
+            args_str += "B,"
+        if transb is None:
+            args_str += "transb,"
+        if out is None:
+            args_str += "out,"
+        if quantization_params is None:
+            args_str += "quantization_params,"
+        if out_dtype is None:
+            args_str += "out_dtype,"
+        if bias is None:
+            args_str += "bias,"
+        if bias_dtype is None:
+            args_str += "bias_dtype,"
+        if gelu is None:
+            args_str += "gelu,"
+        if gelu_in is None:
+            args_str += "gelu_in,"
+        if grad is None:
+            args_str += "grad,"
+        if workspace is None:
+            args_str += "workspace,"
+        if workspace.shape[0] is None:
+            args_str += "workspace.shape[0],"
+        if accumulate is None:
+            args_str += "accumulate,"
+        if use_split_accumulator is None:
+            args_str += "use_split_accumulator,"
+        logger.info(f"DEBUG general_gemm: args values: {args_str}")
 
     out, bias_grad, gelu_input, extra_output = tex.generic_gemm(*args, **kwargs)
 

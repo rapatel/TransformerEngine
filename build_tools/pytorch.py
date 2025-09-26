@@ -45,6 +45,8 @@ def setup_pytorch_extension(
 
     # Compiler flags
     cxx_flags = ["-O3", "-fvisibility=hidden"]
+    # Enable detailed pybind11 error messages
+    cxx_flags.append("-DPYBIND11_DETAILED_ERROR_MESSAGES")
     if debug_build_enabled():
         cxx_flags.append("-g")
         cxx_flags.append("-UNDEBUG")
