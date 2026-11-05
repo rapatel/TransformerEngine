@@ -4,6 +4,7 @@
 
 """Helper functions for using fp8/nvfp4 tensors as weights"""
 
+import os
 from typing import Optional, Union, List
 import torch
 
@@ -208,6 +209,7 @@ def quantize_master_weights(
     group,
     fsdp_shard_model_weights=None,
     manual_post_all_gather_processing=False,
+    gemm_swizzled_scales=None,
 ):
     r"""Helper function to cast master weights to quantized (FP8/NVFP4) primary weights.
 
@@ -233,6 +235,11 @@ def quantize_master_weights(
                      If True, the timing of calling post_all_gather_processing is left to the user.
                      Note that users must call `post_all_gather_processing` if it's set to True,
                      otherwise the weights won't be updated correctly.
+    gemm_swizzled_scales : list of bools, optional.
+                     Per model weight, whether an MXFP8 weight receives its scales in the
+                     GEMM-swizzled layout (``_with_gemm_swizzled_scales=True``), which saves
+                     swizzling them in every GEMM. Only for weights whose consumers accept
+                     swizzled scales (not FSDP2). Ignored for other formats.
 
     """
 
@@ -240,9 +247,14 @@ def quantize_master_weights(
     current_scaling_params = []
     blockwise_scaling_params = []
     mxfp8_scaling_params = []
+    mxfp8_gemm_swizzled_scales = []
     nvfp4_params = []
     identity_params = []
 
+    if gemm_swizzled_scales is None:
+        gemm_swizzled_scales = [False] * len(model_weights)
+    if len(gemm_swizzled_scales) != len(model_weights):
+        raise ValueError("gemm_swizzled_scales must have one entry per model weight")
     if fsdp_shard_model_weights is None:
         use_fsdp_shard_model_weights = False
         fsdp_shard_model_weights = [None] * len(model_weights)
@@ -265,8 +277,12 @@ def quantize_master_weights(
                 fsdp_shard_model_weight,
             )
 
-    for model_weight, master_weight, start_offset, fsdp_shard_model_weight in zip(
-        model_weights, master_weights, start_offsets, fsdp_shard_model_weights
+    for model_weight, master_weight, start_offset, fsdp_shard_model_weight, swizzle in zip(
+        model_weights,
+        master_weights,
+        start_offsets,
+        fsdp_shard_model_weights,
+        gemm_swizzled_scales,
     ):
         # Clear `_high_precision_init_val` of model_weight automatically.
         # - Master weights are initialized from model weights, if we use fp8 primary weights to
@@ -283,14 +299,15 @@ def quantize_master_weights(
         if hasattr(model_weight, "clear_high_precision_init_val"):
             model_weight.clear_high_precision_init_val()
 
-        if master_weight is not None:
+        quantizer = model_weight._get_quantizer()
+
+        if master_weight is not None and not isinstance(quantizer, MXFP8Quantizer):
             # When not using fp8/fp4_primary_weights, the master_weight (fp32) is first cast to
             # bf16/fp16, and then cast to fp8 during forward. Although it's not necessary when
             # fp8/fp4_primary_weights is enabled, we still keep this logic to keep numerical
-            # consistency. So here we cast the master_weight to model_weight.dtype.
+            # consistency. So here we cast the master_weight to model_weight.dtype. The MXFP8
+            # path does the same cast itself.
             master_weight = master_weight.to(model_weight.dtype)
-
-        quantizer = model_weight._get_quantizer()
 
         if isinstance(quantizer, NVFP4Quantizer):
             nvfp4_params.append(
@@ -312,6 +329,7 @@ def quantize_master_weights(
             mxfp8_scaling_params.append(
                 (model_weight, master_weight, start_offset, fsdp_shard_model_weight)
             )
+            mxfp8_gemm_swizzled_scales.append(bool(swizzle))
         elif isinstance(quantizer, IdentityQuantizer):
             identity_params.append(
                 (model_weight, master_weight, start_offset, fsdp_shard_model_weight)
@@ -337,7 +355,9 @@ def quantize_master_weights(
     if len(blockwise_scaling_params) > 0:
         _cast_master_weights_to_fp8_blockwise_scaling(blockwise_scaling_params, *extra_args)
     if len(mxfp8_scaling_params) > 0:
-        _cast_master_weights_to_fp8_mxfp8_scaling(mxfp8_scaling_params, *extra_args)
+        _cast_master_weights_to_fp8_mxfp8_scaling(
+            mxfp8_scaling_params, *extra_args, gemm_swizzled_scales=mxfp8_gemm_swizzled_scales
+        )
     if len(nvfp4_params) > 0:
         _cast_master_weights_to_nvfp4_2d(nvfp4_params, *extra_args)
     if len(identity_params) > 0:
@@ -1024,8 +1044,16 @@ def _cast_master_weights_to_identity(
         target_slice.copy_(master_weight.reshape(-1))
 
 
+def _use_triton_mxfp8_master_cast() -> bool:
+    return os.getenv("NVTE_MXFP8_TRITON_MASTER_CAST", "0") == "1"
+
+
 def _cast_master_weights_to_fp8_mxfp8_scaling(
-    params, group, use_fsdp_shard_model_weights=False, manual_post_all_gather_processing=False
+    params,
+    group,
+    use_fsdp_shard_model_weights=False,
+    manual_post_all_gather_processing=False,
+    gemm_swizzled_scales=None,
 ):  # pylint: disable=unused-argument
     r"""Helper function to cast master weights to FP8 primary weights for mxfp8 scaling.
 
@@ -1034,11 +1062,37 @@ def _cast_master_weights_to_fp8_mxfp8_scaling(
     Parameters
     ----------
     params : List of tuple, each tuple contains a model weight, a master weight, and an offset
-             indicating the starting index of the master weight in the model weight.
+             indicating the starting index of the master weight in the model weight. Master
+             weights are rounded to the model weight dtype before quantization.
     group  : The distributed group to do amax reduction. Typically it's the data parallel
              group.
     use_fsdp_shard_model_weights : bool, if True, it means that the model weights are sharded.
+    gemm_swizzled_scales : list of bools, optional. Per model weight, whether its scales are
+             written in the GEMM-swizzled layout.
     """
+    if gemm_swizzled_scales is None:
+        gemm_swizzled_scales = [False] * len(params)
+
+    # NVTE_MXFP8_TRITON_MASTER_CAST=1 batches the whole cast into a few Triton launches.
+    if _use_triton_mxfp8_master_cast():
+        from ..triton.mxfp8_master_weights import (  # pylint: disable=import-outside-toplevel
+            cast_master_weights_to_mxfp8,
+        )
+
+        if cast_master_weights_to_mxfp8(
+            params, group, use_fsdp_shard_model_weights, gemm_swizzled_scales
+        ):
+            return
+
+    params = [
+        (
+            model_weight,
+            master_weight.to(model_weight.dtype) if master_weight is not None else None,
+            start_offset,
+            fragment,
+        )
+        for model_weight, master_weight, start_offset, fragment in params
+    ]
 
     # Parameter attributes
     device = params[0][0].device
@@ -1204,6 +1258,20 @@ def _cast_master_weights_to_fp8_mxfp8_scaling(
             w,
             start_offset,
         )
+
+    # ---------------------------------------------------------------------------------------------
+    # Step 5: Swizzle the scales of the flagged weights for GEMM, in their existing buffers.
+    # ---------------------------------------------------------------------------------------------
+    for (model_weight, _, _, _), swizzle in zip(params, gemm_swizzled_scales):
+        model_weight._with_gemm_swizzled_scales = False
+        if not swizzle:
+            continue
+        compact = (model_weight._rowwise_scale_inv, model_weight._columnwise_scale_inv)
+        tex.swizzle_scales_for_gemm_(model_weight)
+        for name, buf in zip(("_rowwise_scale_inv", "_columnwise_scale_inv"), compact):
+            if buf is not None:
+                buf.copy_(getattr(model_weight, name))
+                setattr(model_weight, name, buf)
 
 
 # ---------------------------------------------------------------------------------------------
